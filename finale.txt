@@ -1,0 +1,314 @@
+#include <avr/io.h>            // AVR I/O definitions
+#include <util/delay.h>        // Delay functions
+#include <stdlib.h>            // Standard library definitions
+#include <avr/interrupt.h>     // Interrupt handling
+
+#define F_CPU 16000000UL       // Define CPU frequency for delay
+#define BAUD 9600              // Define baud rate for USART
+#define MYUBRR F_CPU/16/BAUD-1 // Calculate USART baud rate value
+
+#define pinEcho PORTB0         // Echo pin for ultrasonic sensor
+#define pinTrigger PORTB1      // Trigger pin for ultrasonic sensor
+
+#define pinButton PD3          // Button pin (INT1)
+#define pinButton2 PD2         // Second button pin (INT0)
+
+#define pinMotor PD4           // Pin for controlling DC motor
+
+#define pinLED PD7             // Pin for LED
+
+#define pinPhotocell PC0       // Photocell (light sensor) pin
+
+// ADC channel
+#define ADC_CHANNEL 0
+
+// ADC reference voltage (5V)
+#define V_REF 5.0
+
+#define TIMER1_PRESCALER 1024 // Prescaler value for Timer1
+#define TIMER1_PERIOD_MS 500   // Period of Timer1 interrupt in milliseconds
+
+volatile uint8_t systemOn = 0; // Flag to indicate system state
+
+// Function prototypes
+void USART_Init(unsigned int ubrr);
+void USART_Transmit(unsigned char data);
+void txString(const char *pStr);
+void sendRange(double value);
+double measureDistance(void);
+void ADC_Init(void);
+uint16_t ADC_Read(uint8_t channel);
+void Timer1_Init(void);
+void Analog_Comparator_Init(void);
+void LEDinit(void);
+void PWM_Init(void);
+void setMotorSpeed(uint8_t speed);
+int ToggleLED(void);
+int readPhotocell(void); // Function prototype for reading photocell
+
+ISR(INT1_vect)
+{
+    // Debounce delay
+    _delay_ms(50); // Increased debounce delay for better reliability
+
+    // Check if button is still pressed
+    if (!(PIND & (1 << pinButton)))
+    {
+        systemOn = !systemOn; // Toggle system state
+        if (!systemOn)
+        {
+            // Turn off the motor when the system is turned off
+            setMotorSpeed(0);
+        }
+    }
+
+    // Clear the interrupt flag (this happens automatically for INT1)
+}
+
+ISR(INT0_vect)
+{
+    // Debounce delay
+    _delay_ms(50);
+
+    // Toggle system state
+    systemOn = !systemOn;
+}
+
+ISR(TIMER1_COMPA_vect)
+{
+    // Toggle motor state
+    PORTD ^= (1 << pinMotor);
+}
+
+ISR(ANALOG_COMP_vect)
+{
+    // Analog Comparator ISR
+    // Perform actions when the analog comparator triggers (e.g., toggle an LED)
+    ToggleLED(); // Toggle LED state
+}
+
+int main(void)
+{
+    USART_Init(MYUBRR); // Initialise USART
+    DDRB |= (1 << pinTrigger);                                     // Set trigger pin as output
+    DDRD &= ~(1 << pinButton) & ~(1 << pinButton2);                // Set button pins as input
+    DDRD |= (1 << pinMotor);                                       // Set motor pin as output
+    PORTD |= (1 << pinButton) | (1 << pinButton2);                 // Enable pull-up resistors for button pins
+
+    // Configure INT1 for falling edge trigger
+    EICRA |= (1 << ISC11);
+    EICRA &= ~(1 << ISC10);
+    EIMSK |= (1 << INT1); // Enable INT1
+
+    // Configure INT0 for falling edge trigger
+    EICRA |= (1 << ISC01);
+    EICRA &= ~(1 << ISC00);
+    EIMSK |= (1 << INT0); // Enable INT0
+
+    ADC_Init();                   // Initialize ADC
+    Timer1_Init();                // Initialize Timer1
+    Analog_Comparator_Init();     // Initialize Analog Comparator
+    LEDinit();                    // Initialize LED
+    PWM_Init();                   // Initialize PWM for motor speed control
+
+    sei(); // Enable global interrupts
+
+    while (1)
+    {
+        if (systemOn)
+        { // Check if system is on
+            double distance = measureDistance(); // Measure distance
+            sendRange(distance);                 // Send range data over USART
+
+            // Calculate motor speed based on distance
+            // Example: Linear mapping, adjust as needed
+            uint8_t motorSpeed = (uint8_t)(255 * (1 - distance / 50.0)); // 50cm maximum distance
+
+            // Set motor speed
+            setMotorSpeed(motorSpeed);
+
+            // Read light level from photocell
+            int lightLevel = readPhotocell();
+
+            // Adjust LED brightness based on light level
+            // Example: Linear mapping, adjust as needed
+            uint8_t ledBrightness = (uint8_t)(255 * (lightLevel / 1023.0)); // Assuming 10-bit ADC
+
+            // Set LED brightness
+            OCR0A = ledBrightness;
+
+            _delay_ms(1000); // Delay between measurements
+        }
+        else
+        {
+            // Stop the motor
+            setMotorSpeed(0);
+        }
+    }
+}
+
+// Function to read the photocell (light sensor)
+int readPhotocell(void)
+{
+    // Read ADC value
+    uint16_t adc_value = ADC_Read(ADC_CHANNEL);
+
+    return adc_value;
+}
+
+// USART initialisation function
+void USART_Init(unsigned int ubrr)
+{
+    // Set baud rate
+    UBRR0H = (unsigned char)(ubrr >> 8);
+    UBRR0L = (unsigned char)ubrr;
+    // Enable receiver and transmitter
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0);
+    // Set frame format: 8data, 1stop bit
+    UCSR0C = (3 << UCSZ00);
+}
+
+// USART transmit function
+void USART_Transmit(unsigned char data)
+{
+    // Wait for empty transmit buffer
+    while (!(UCSR0A & (1 << UDRE0)))
+        ;
+    // Put data into buffer, sends the data
+    UDR0 = data;
+}
+
+// Transmit string over USART
+void txString(const char *pStr)
+{
+    while (*pStr != '\0')
+    {
+        USART_Transmit(*pStr++);
+    }
+}
+
+// Send range data over USART
+void sendRange(double value)
+{
+    char buffer[10];
+    // Convert double to string
+    dtostrf(value, 6, 2, buffer);
+    txString(buffer);
+    txString("\n");
+}
+
+// Measure distance using ultrasonic sensor
+double measureDistance(void)
+{
+    // Read ADC value
+    uint16_t adc_value = ADC_Read(ADC_CHANNEL);
+
+    // Calculate voltage from ADC value
+    double voltage = (adc_value * V_REF) / 1023.0;
+
+    // Convert voltage to distance (example formula, adjust according to sensor characteristics)
+    double distance = voltage * 10.0; // Example: assuming linear relationship between voltage and distance
+
+    return distance;
+}
+
+// ADC initialization function
+void ADC_Init(void)
+{
+    // Set reference voltage to AVCC
+    ADMUX |= (1 << REFS0);
+    // Enable ADC and set prescaler to 128 (16MHz / 128 = 125kHz)
+    ADCSRA |= (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+}
+
+// ADC read function
+uint16_t ADC_Read(uint8_t channel)
+{
+    // Clear previous channel selection and set new channel
+    ADMUX &= 0xF0;
+    ADMUX |= channel;
+
+    // Start single conversion
+    ADCSRA |= (1 << ADSC);
+
+    // Wait for conversion to complete
+    while (ADCSRA & (1 << ADSC))
+        ;
+
+    // Return ADC value
+    return ADC;
+}
+
+// Timer1 initialization function
+void Timer1_Init(void)
+{
+    // Set CTC mode (Clear Timer on Compare Match)
+    TCCR1B |= (1 << WGM12);
+    // Set prescaler to 1024
+    TCCR1B |= (1 << CS12) | (1 << CS10);
+    // Set compare value for 500ms interrupt period
+    OCR1A = (F_CPU / (TIMER1_PRESCALER * 2UL * 1000UL)) * TIMER1_PERIOD_MS - 1;
+    // Enable Timer1 Compare A interrupt
+    TIMSK1 |= (1 << OCIE1A);
+}
+
+// Analog Comparator initialization function
+void Analog_Comparator_Init(void)
+{
+    // Configure Analog Comparator Negative Input (AIN0) to connect to AIN1 (internal bandgap reference)
+    ACSR |= (1 << ACBG); // Set ACBG bit
+
+    // Configure Analog Comparator Positive Input (AIN1) to connect to PC0 (photocell input)
+    // Set the AIN1 bit to select the AIN1 pin (PC0)
+    ACSR &= ~(1 << ACI); // Clear ACI bit
+
+    // Enable Analog Comparator Interrupt
+    ACSR |= (1 << ACIE);
+
+    // Configure interrupt trigger condition (e.g., falling edge)
+    // Set the ACIS1 and ACIS0 bits according to your desired trigger condition
+    // Here, we choose falling edge triggering (ACIS1 = 0, ACIS0 = 1)
+    ACSR &= ~(1 << ACIS1);
+    ACSR |= (1 << ACIS0);
+}
+
+// Initialize PWM for motor speed control
+void PWM_Init(void)
+{
+    // Set PWM pin as output
+    DDRD |= (1 << pinMotor);
+
+    // Configure Timer/Counter2 for Fast PWM mode with non-inverted output
+    TCCR2A |= (1 << WGM21) | (1 << WGM20); // Fast PWM Mode
+    TCCR2A |= (1 << COM2B1);               // Non-inverted PWM on OCR2B
+    TCCR2B |= (1 << CS22);                 // Prescaler 64, results in 976.5625 Hz PWM frequency
+
+    // Set initial duty cycle to 0
+    OCR2B = 0;
+}
+
+// Initialize LED pin
+void LEDinit(void)
+{
+    // Set LED pin as output
+    DDRD |= (1 << pinLED);
+}
+
+// Set motor speed using PWM
+void setMotorSpeed(uint8_t speed)
+{
+    // Ensure speed is within bounds (0-255)
+    if (speed > 255)
+    {
+        speed = 255;
+    }
+    // Set PWM duty cycle
+    OCR2B = speed;
+}
+
+// Toggle LED state
+int ToggleLED(void)
+{
+    PORTD ^= (1 << pinLED); // Toggle LED
+    return 0;
+}
